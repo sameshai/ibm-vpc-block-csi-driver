@@ -16,10 +16,10 @@
 
 EXE_DRIVER_NAME=ibm-vpc-block-csi-driver
 DRIVER_NAME=vpcBlockDriver
-IMAGE = contsto2/${EXE_DRIVER_NAME}
+IMAGE = ambikanair/${EXE_DRIVER_NAME}
 GOPACKAGES=$(shell go list ./... | grep -v /vendor/ | grep -v /cmd | grep -v /tests)
 VERSION := latest
-PROXY_IMAGE_URL:="registry.ng.bluemix.net"
+PROXY_IMAGE_URL:= "registry.access.redhat.com"
 
 GIT_COMMIT_SHA="$(shell git rev-parse HEAD 2>/dev/null)"
 GIT_REMOTE_URL="$(shell git config --get remote.origin.url 2>/dev/null)"
@@ -130,3 +130,7 @@ updatebaseline:
 .PHONY: auditbaseline
 auditbaseline:
 	detect-secrets audit .secrets.baseline
+
+.PHONY: push
+push:
+	docker push $(IMAGE):$(VERSION)
