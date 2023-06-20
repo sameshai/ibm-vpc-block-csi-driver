@@ -26,6 +26,7 @@ import (
 	"github.com/IBM/secret-utils-lib/pkg/config"
 	"github.com/IBM/secret-utils-lib/pkg/k8s_utils"
 	"github.com/IBM/secret-utils-lib/pkg/utils"
+	"github.com/go-playground/validator/v10"
 	"go.uber.org/zap"
 )
 
@@ -45,13 +46,16 @@ type UnmanagedSecretProvider struct {
 }
 
 // newUnmanagedSecretProvider ...
-func newUnmanagedSecretProvider(logger *zap.Logger, optionalArgs ...map[string]string) (*UnmanagedSecretProvider, error) {
-	kc, err := k8s_utils.Getk8sClientSet(logger)
+func newUnmanagedSecretProvider(k8sClient *k8s_utils.KubernetesClient, logger *zap.Logger, optionalArgs ...map[string]string) (*UnmanagedSecretProvider, error) {
+	// Validate the argument k8s client
+	validate := validator.New()
+	err := validate.Struct(k8sClient)
 	if err != nil {
-		logger.Info("Error fetching k8s client set", zap.Error(err))
-		return nil, err
+		logger.Error("Provided k8s client is invalid", zap.Error(err))
+		return nil, utils.Error{Description: "Error initialising k8s client", BackendError: err.Error()}
 	}
-	return InitUnmanagedSecretProvider(logger, kc, optionalArgs...)
+
+	return InitUnmanagedSecretProvider(logger, *k8sClient, optionalArgs...)
 }
 
 // initUnmanagedSecretProvider ...
@@ -86,9 +90,17 @@ func InitUnmanagedSecretProvider(logger *zap.Logger, kc k8s_utils.KubernetesClie
 	usp.k8sClient = kc
 
 	err = usp.initEndpointsUsingCloudConf()
-	if err == nil {
+	// If token exchange URL is also initialised using cloud conf, return.
+	if usp.tokenExchangeURL != "" {
 		logger.Info("Initialized unmanaged secret provider")
 		return usp, nil
+	}
+
+	// Determine whether cluster provider is satellite.
+	var isSatellite bool
+	cc, err := config.GetClusterInfo(kc, logger)
+	if err == nil {
+		isSatellite = config.IsSatellite(cc, logger)
 	}
 
 	var providerName string
@@ -98,12 +110,15 @@ func InitUnmanagedSecretProvider(logger *zap.Logger, kc k8s_utils.KubernetesClie
 	if providerName == "" {
 		providerName = utils.VPC
 	}
-	err = usp.initEndpointsUsingStorageSecretStore(providerName)
-	if err != nil {
-		logger.Error("Error initializing secret provider")
-		return nil, utils.Error{Description: localutils.ErrInitSecretProvider, BackendError: err.Error()}
+	err = usp.initEndpointsUsingStorageSecretStore(isSatellite, providerName)
+	if usp.tokenExchangeURL != "" {
+		logger.Info("Initialized unmanaged secret provider")
+		return usp, nil
 	}
 
+	usp.tokenExchangeURL = config.FrameTokenExchangeURLFromClusterInfo(isSatellite, cc, logger)
+	usp.authenticator.SetURL(usp.tokenExchangeURL)
+	logger.Info("Framed token exhange URL from cluster info")
 	logger.Info("Initialized unmanaged secret provider")
 	return usp, nil
 }
@@ -220,6 +235,7 @@ func (usp *UnmanagedSecretProvider) initEndpointsUsingCloudConf() error {
 	usp.riaasEndpoint = cloudConf.RiaasEndpoint
 	usp.privateRIAASEndpoint = cloudConf.PrivateRIAASEndpoint
 	usp.resourceGroupID = cloudConf.ResourceGroupID
+	usp.logger.Info("Initialised endpoints using cloud-conf")
 	if cloudConf.TokenExchangeURL != "" {
 		usp.logger.Info("Using the token exchange URL provided in cloud-conf")
 		usp.tokenExchangeURL = cloudConf.TokenExchangeURL
@@ -227,47 +243,40 @@ func (usp *UnmanagedSecretProvider) initEndpointsUsingCloudConf() error {
 		return nil
 	}
 
-	usp.logger.Info("Token exchange URL not provided in cloud-conf, framing using cluster-info")
-	tokenExchangeURL, err := frameTokenExchangeURL(usp.k8sClient, usp.logger)
-	if err != nil {
-		usp.logger.Error("Error forming token exchange URL from cluster-info", zap.Error(err))
-		return utils.Error{Description: localutils.ErrInitSecretProvider, BackendError: "Unable to fetch token exchange URL"}
-	}
-
-	usp.tokenExchangeURL = tokenExchangeURL
-	usp.authenticator.SetURL(tokenExchangeURL)
+	usp.logger.Info("Token exchange URL not provided in cloud-conf")
 	return nil
 }
 
 // initEndpointsUsingStorageSecretStore ...
-func (usp *UnmanagedSecretProvider) initEndpointsUsingStorageSecretStore(providerType string) error {
+func (usp *UnmanagedSecretProvider) initEndpointsUsingStorageSecretStore(isSatellite bool, providerType string) error {
 	data, err := k8s_utils.GetSecretData(usp.k8sClient, utils.STORAGE_SECRET_STORE_SECRET, utils.SECRET_STORE_FILE)
 	var conf *config.Config
-	if err == nil {
-		conf, _ = config.ParseConfig(usp.logger, data)
+	if err != nil {
+		usp.logger.Warn("Error fetching storage-secret-store data", zap.Error(err))
+		return err
 	}
 
-	if conf != nil {
-		usp.containerAPIRoute = conf.Bluemix.APIEndpointURL
-		usp.privateContainerAPIRoute = conf.Bluemix.PrivateAPIRoute
-		usp.riaasEndpoint = conf.VPC.G2EndpointURL
-		usp.privateRIAASEndpoint = conf.VPC.G2EndpointPrivateURL
-		usp.resourceGroupID = conf.VPC.G2ResourceGroupID
-		tokenExchangeURL, err := config.GetTokenExchangeURLfromStorageSecretStore(*conf, providerType)
-		if err == nil {
-			usp.tokenExchangeURL = tokenExchangeURL
-			usp.authenticator.SetURL(tokenExchangeURL)
-			return nil
-		}
+	conf, err = config.ParseConfig(usp.logger, data)
+	if err != nil {
+		usp.logger.Warn("Error parsing storage-secret-store data", zap.Error(err))
+		return err
+	}
+
+	usp.containerAPIRoute = conf.Bluemix.APIEndpointURL
+	usp.privateContainerAPIRoute = conf.Bluemix.PrivateAPIRoute
+	usp.riaasEndpoint = conf.VPC.G2EndpointURL
+	usp.privateRIAASEndpoint = conf.VPC.G2EndpointPrivateURL
+	usp.resourceGroupID = conf.VPC.G2ResourceGroupID
+	usp.logger.Info("Fetched endpoints from storage-secret-store")
+
+	tokenExchangeURL, err := config.GetTokenExchangeURLfromStorageSecretStore(isSatellite, *conf, providerType)
+	if err == nil {
+		usp.logger.Info("Framed token exchange URL using storage-secret-store")
+		usp.tokenExchangeURL = tokenExchangeURL
+		usp.authenticator.SetURL(tokenExchangeURL)
+		return nil
 	}
 
 	usp.logger.Info("Unable to fetch token exchange URL from storage-secret-store")
-	tokenExchangeURL, err := frameTokenExchangeURL(usp.k8sClient, usp.logger)
-	if err != nil {
-		usp.logger.Error("Error forming token exchange URL from cluster-info", zap.Error(err))
-		return err
-	}
-	usp.tokenExchangeURL = tokenExchangeURL
-	usp.authenticator.SetURL(tokenExchangeURL)
 	return nil
 }
