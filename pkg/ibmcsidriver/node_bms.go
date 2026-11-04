@@ -29,7 +29,8 @@ package ibmcsidriver
 //     subsysRefCount prevents premature disconnect (OPT 3 / OPT 4).
 //   - State file:  written at NodeStageVolume, read at NodeUnstageVolume because
 //     NodeUnstageVolumeRequest carries no publishContext (CSI spec §3.4.2).
-//   - Device path: /dev/disk/by-id/nvme-uuid.<full-volumeID>
+//   - Device path: /dev/disk/by-id/nvme-uuid.<namespace-uuid>, where the UUID is
+//     the volume ID without its "r134-" style prefix (full ID kept as fallback).
 
 import (
 	"context"
@@ -52,8 +53,36 @@ import (
 )
 
 // bmsDevicePathPrefix is the stable by-id path for NVMe volumes on BMS nodes.
-// The full path is: /dev/disk/by-id/nvme-uuid.<volumeID>
+// The link name is built by the kernel from the namespace UUID, which is the
+// UUID part of the VPC volume ID (the volume ID without its "r134-" style
+// region prefix). The full path is: /dev/disk/by-id/nvme-uuid.<namespace-uuid>
 const bmsDevicePathPrefix = "/dev/disk/by-id/nvme-uuid."
+
+// uuidLen is the length of a canonical textual UUID (8-4-4-4-12).
+const uuidLen = 36
+
+// bmsDevicePathCandidates returns the by-id paths to look for, most likely first.
+//
+// The kernel names the link after the namespace UUID, e.g. for volume
+// "r134-342f4b28-b6f0-4b23-b9c5-0cdf036f4948" it creates
+// "nvme-uuid.342f4b28-b6f0-4b23-b9c5-0cdf036f4948" (no "r134-"). The full
+// volume ID is kept as a fallback in case a different image/kernel uses it.
+func bmsDevicePathCandidates(volumeID string) []string {
+	var paths []string
+	// The UUID is always the last 36 chars, preceded by the "-" that separates
+	// it from the region prefix. This does not depend on the prefix length.
+	if n := len(volumeID); n > uuidLen+1 && volumeID[n-uuidLen-1] == '-' {
+		paths = append(paths, bmsDevicePathPrefix+volumeID[n-uuidLen:])
+	}
+	return append(paths, bmsDevicePathPrefix+volumeID)
+}
+
+// isNVMeAlreadyConnected reports whether `nvme connect` failed only because the
+// controller for this subsystem/address/host is already connected. That is not
+// a failure for staging: the subsystem's namespaces are already present.
+func isNVMeAlreadyConnected(output string) bool {
+	return strings.Contains(strings.ToLower(output), "already connected")
+}
 
 // bmsDeviceWaitTimeout is the maximum time to wait for the NVMe device path to
 // appear after a successful nvme connect.
@@ -136,11 +165,16 @@ func decryptBMSSecret(privKeyPEM []byte, cipherB64 string) (string, error) {
 		return "", fmt.Errorf("decryptBMSSecret: failed to base64-decode ciphertext: %w", err) // pragma: allowlist secret
 	}
 
-	// RSA-OAEP decrypt with SHA-256 (must match the encryption scheme used by the
-	// VPC API / controller — VPC encrypts PSKs using RSA-OAEP + SHA-256).
-	plaintext, err := rsa.DecryptOAEP(sha256.New(), rand.Reader, privKey, cipherBytes, nil)
-	if err != nil {
-		return "", fmt.Errorf("decryptBMSSecret: RSA-OAEP decrypt failed: %w", err) // pragma: allowlist secret
+	// Try RSA-OAEP (SHA-256) first. The staging VPC API has been observed to
+	// encrypt the PSK with PKCS#1 v1.5 instead, so fall back to that if OAEP fails.
+	plaintext, oaepErr := rsa.DecryptOAEP(sha256.New(), rand.Reader, privKey, cipherBytes, nil)
+	if oaepErr == nil {
+		return string(plaintext), nil
+	}
+	// we can remove this
+	plaintext, pkcsErr := rsa.DecryptPKCS1v15(rand.Reader, privKey, cipherBytes)
+	if pkcsErr != nil {
+		return "", fmt.Errorf("decryptBMSSecret: RSA decrypt failed (OAEP-SHA256: %v; PKCS1v15: %v)", oaepErr, pkcsErr) // pragma: allowlist secret
 	}
 	return string(plaintext), nil
 }
@@ -158,9 +192,6 @@ func decryptBMSSecret(privKeyPEM []byte, cipherB64 string) (string, error) {
 // This must be called once per subsystem before the first nvme connect so the
 // kernel NVMe/TCP driver can hand the key to tlshd for TLS 1.3 negotiation.
 func nvmeCheckTLSKey(ctxLogger *zap.Logger, hostNQN, subsysNQN, psk string) error {
-	ctxLogger.Info("nvmeCheckTLSKey: inserting PSK into kernel keyring",
-		zap.String("hostNQN", hostNQN), zap.String("subsysNQN", subsysNQN))
-
 	args := []string{
 		"check-tls-key",
 		"--hostnqn", hostNQN,
@@ -173,7 +204,7 @@ func nvmeCheckTLSKey(ctxLogger *zap.Logger, hostNQN, subsysNQN, psk string) erro
 	if err != nil {
 		return fmt.Errorf("nvmeCheckTLSKey: failed for subsys %s: %s: %w", subsysNQN, string(out), err)
 	}
-	ctxLogger.Info("nvmeCheckTLSKey: PSK inserted successfully", zap.String("subsysNQN", subsysNQN))
+	ctxLogger.Info("nvmeCheckTLSKey: PSK inserted successfully", zap.String("hostNQN", hostNQN), zap.String("subsysNQN", subsysNQN))
 	return nil
 }
 
@@ -189,48 +220,86 @@ func nvmeCheckTLSKey(ctxLogger *zap.Logger, hostNQN, subsysNQN, psk string) erro
 // --hostnqn pins the initiator NQN read from /etc/nvme/hostnqn (mounted from host).
 // --tls tells the kernel to use TLS 1.3 (via tlshd); the PSK was already
 // inserted into the keyring by nvmeCheckTLSKey.
-// targetIPs is a comma-separated list; we attempt each IP in order and return
-// on the first success (multipath — kernel handles failover after connect).
+// targetIPs is a comma-separated list; we connect to EVERY IP, not just the
+// first that works. The target reports a per-path ANA state, and a volume's
+// namespace is accessible through only some of the IPs (the others report
+// "inaccessible" and the kernel creates no block device for it). Connecting
+// all paths lets any volume of the subsystem find its accessible path.
+// An IP that is already connected counts as connected. The call fails only if
+// no IP could be connected.
 func nvmeConnect(ctxLogger *zap.Logger, hostNQN, subsysNQN, targetIPs string) error {
 	ips := strings.Split(targetIPs, ",")
 	if len(ips) == 0 || (len(ips) == 1 && ips[0] == "") {
 		return fmt.Errorf("nvmeConnect: no target IPs provided for subsystem %s", subsysNQN)
 	}
 
+	connected := 0
 	for _, ip := range ips {
 		ip = strings.TrimSpace(ip)
 		if ip == "" {
+			//todo: logline
 			continue
 		}
-		args := []string{
-			"connect",
-			"--transport", "tcp",
-			"--traddr", ip,
-			"--trsvcid", "4420",
-			"--nqn", subsysNQN,
-			"--hostnqn", hostNQN,
-			"--tls",
-		}
-		ctxLogger.Info("nvmeConnect: executing nvme connect",
-			zap.String("subsysNQN", subsysNQN),
-			zap.String("hostNQN", hostNQN),
-			zap.String("targetIP", ip))
-		out, err := exec.Command("nvme", args...).CombinedOutput() // #nosec G204
-		if err != nil {
-			ctxLogger.Warn("nvmeConnect: nvme connect attempt failed (will try next IP if available)",
-				zap.String("ip", ip), zap.String("output", string(out)), zap.Error(err))
+		if err := nvmeConnectByIP(ctxLogger, hostNQN, subsysNQN, ip); err != nil {
+			ctxLogger.Warn("nvmeConnect: nvme connect attempt failed (continuing with other IPs)",
+				zap.String("ip", ip), zap.Error(err))
 			continue
 		}
-		ctxLogger.Info("nvmeConnect: nvme connect succeeded", zap.String("ip", ip))
+		connected++
+	}
+	if connected == 0 {
+		return fmt.Errorf("nvmeConnect: all target IPs failed for subsystem %s", subsysNQN)
+	}
+	return nil
+}
+
+// nvmeConnectByIP runs `nvme connect` for a single target IP. It returns nil
+// on success, and also when the address is already connected (e.g. retry of a
+// previous NodeStageVolume, or a connection that outlived a driver restart) so
+// that staging is idempotent. Any other failure is returned with the nvme
+// output included.
+func nvmeConnectByIP(ctxLogger *zap.Logger, hostNQN, subsysNQN, ip string) error {
+	args := []string{
+		"connect",
+		"--transport", "tcp",
+		"--traddr", ip,
+		"--trsvcid", "4420",
+		"--nqn", subsysNQN,
+		"--hostnqn", hostNQN,
+		"--tls",
+	}
+	ctxLogger.Info("nvmeConnectByIP: executing nvme connect",
+		zap.String("subsysNQN", subsysNQN),
+		zap.String("hostNQN", hostNQN),
+		zap.String("targetIP", ip),
+		zap.String("command", "nvme "+strings.Join(args, " ")))
+	start := time.Now()
+	out, err := nvmeRun(args...)
+	output := strings.TrimSpace(string(out))
+	if err != nil && isNVMeAlreadyConnected(output) {
+		ctxLogger.Info("nvmeConnectByIP: address already connected — counting as connected",
+			zap.String("ip", ip), zap.String("output", output),
+			zap.Duration("elapsed", time.Since(start)))
 		return nil
 	}
-	return fmt.Errorf("nvmeConnect: all target IPs failed for subsystem %s", subsysNQN)
+	if err != nil {
+		return fmt.Errorf("nvmeConnectByIP: nvme connect to %s failed after %s: %s: %w ", ip, time.Since(start), output, err)
+	}
+	ctxLogger.Info("nvmeConnectByIP: nvme connect succeeded",
+		zap.String("ip", ip), zap.String("output", output),
+		zap.Duration("elapsed", time.Since(start)))
+	return nil
+}
+
+// nvmeRun runs the nvme CLI and returns its combined output. A variable so
+// tests can replace it.
+var nvmeRun = func(args ...string) ([]byte, error) {
+	return exec.Command("nvme", args...).CombinedOutput() // #nosec G204
 }
 
 // nvmeDisconnect runs `nvme disconnect` for the given subsystem NQN.
 // Called only when subsysRefCount reaches 0 (last volume on subsystem) (OPT 4).
 func nvmeDisconnect(ctxLogger *zap.Logger, subsysNQN string) error {
-	ctxLogger.Info("nvmeDisconnect: executing nvme disconnect", zap.String("subsysNQN", subsysNQN))
 	out, err := exec.Command("nvme", "disconnect", "--nqn", subsysNQN).CombinedOutput() // #nosec G204
 	if err != nil {
 		return fmt.Errorf("nvmeDisconnect: failed for subsystem %s: %s: %w", subsysNQN, string(out), err)
@@ -239,21 +308,24 @@ func nvmeDisconnect(ctxLogger *zap.Logger, subsysNQN string) error {
 	return nil
 }
 
-// waitForBMSDevicePath polls until the NVMe device path appears under
-// /dev/disk/by-id/nvme-uuid.<volumeID> or the timeout is exceeded.
+// waitForBMSDevicePath polls until one of the candidate NVMe device paths (see
+// bmsDevicePathCandidates) appears under /dev/disk/by-id or the timeout is
+// exceeded.
 func waitForBMSDevicePath(ctxLogger *zap.Logger, volumeID string) (string, error) {
-	devicePath := bmsDevicePathPrefix + volumeID
+	candidates := bmsDevicePathCandidates(volumeID)
 	deadline := time.Now().Add(bmsDeviceWaitTimeout)
 	for time.Now().Before(deadline) {
-		if _, err := os.Stat(devicePath); err == nil {
-			ctxLogger.Info("waitForBMSDevicePath: device path appeared",
-				zap.String("devicePath", devicePath))
-			return devicePath, nil
+		for _, devicePath := range candidates {
+			if _, err := os.Stat(devicePath); err == nil {
+				ctxLogger.Info("waitForBMSDevicePath: device path appeared",
+					zap.String("devicePath", devicePath))
+				return devicePath, nil
+			}
 		}
 		time.Sleep(bmsDeviceWaitInterval)
 	}
-	return "", fmt.Errorf("waitForBMSDevicePath: device path %s did not appear within %s",
-		devicePath, bmsDeviceWaitTimeout)
+	return "", fmt.Errorf("waitForBMSDevicePath: none of %v appeared within %s",
+		candidates, bmsDeviceWaitTimeout)
 }
 
 // ─── NodeStageVolume BMS branch ───────────────────────────────────────────────
@@ -298,7 +370,10 @@ func (csiNS *CSINodeServer) nodeStageVolumeBMS(
 		if err != nil {
 			return "", fmt.Errorf("nodeStageVolumeBMS: failed to decrypt PSK for volume %s: %w", volumeID, err)
 		}
-		ctxLogger.Info("nodeStageVolumeBMS: PSK decrypted successfully", zap.String("volumeID", volumeID))
+		ctxLogger.Info("nodeStageVolumeBMS: PSK decrypted successfully",
+			zap.String("volumeID", volumeID),
+			zap.Int("pskLen", len(psk)),
+			zap.Bool("pskFormatOK", strings.HasPrefix(psk, "NVMeTLSkey-1:")))
 	} else {
 		ctxLogger.Warn("nodeStageVolumeBMS: no PSK available — connecting without TLS key",
 			zap.String("volumeID", volumeID))
@@ -313,9 +388,6 @@ func (csiNS *CSINodeServer) nodeStageVolumeBMS(
 	count := csiNS.subsysRefCount[subsysNQN]
 
 	if count == 0 {
-		ctxLogger.Info("nodeStageVolumeBMS: first volume on subsystem — running check-tls-key + nvme connect",
-			zap.String("subsysNQN", subsysNQN))
-
 		if psk != "" {
 			if err := nvmeCheckTLSKey(ctxLogger, hostNQN, subsysNQN, psk); err != nil {
 				csiNS.subsysMu.Unlock()
@@ -359,8 +431,6 @@ func (csiNS *CSINodeServer) nodeStageVolumeBMS(
 
 	// Return the device path; NodeStageVolume runs the shared
 	// findDevicePathSource + safety-check + FormatAndMount + Resize tail.
-	ctxLogger.Info("nodeStageVolumeBMS: NVMe connect complete — handing off to shared mount logic",
-		zap.String("volumeID", volumeID), zap.String("devicePath", devicePath))
 	return devicePath, nil
 }
 
@@ -388,8 +458,6 @@ func (csiNS *CSINodeServer) nodeUnstageVolumeBMS(
 		return nil, fmt.Errorf("nodeUnstageVolumeBMS: unmount failed for volume %s at %s: %w",
 			volumeID, stagingTargetPath, err)
 	}
-	ctxLogger.Info("nodeUnstageVolumeBMS: staging path unmounted",
-		zap.String("stagingTargetPath", stagingTargetPath))
 
 	// Step 2: Decrement subsystem ref count; disconnect when last volume leaves.
 	csiNS.subsysMu.Lock()

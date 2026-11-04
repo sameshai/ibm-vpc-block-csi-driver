@@ -43,9 +43,9 @@ func (vs *VolumeService) GetVolumeEtag(volumeID string, ctxLogger *zap.Logger) (
 	var apiErr models.Error
 
 	request := vs.client.NewRequest(operation)
-	ctxLogger.Info("Equivalent curl command", zap.Reflect("URL", request.URL()), zap.Reflect("Operation", operation))
 
 	req := request.PathParameter(volumeIDParam, volumeID)
+	ctxLogger.Info("Equivalent curl command", zap.Reflect("URL", request.URL()), zap.Reflect("Operation", operation))
 	resp, err := req.JSONSuccess(&volume).JSONError(&apiErr).Invoke()
 
 	if err != nil {

@@ -42,9 +42,9 @@ func (ss *SnapshotService) CheckSnapshotTag(volumeID string, snapshotID string, 
 	var apiErr models.Error
 
 	request := ss.client.NewRequest(operation)
-	ctxLogger.Info("Equivalent curl command", zap.Reflect("URL", request.URL()))
 
 	req := request.PathParameter(volumeIDParam, volumeID).PathParameter(snapshotIDParam, snapshotID).PathParameter(snapshotTagParam, tagName).JSONError(&apiErr)
+	ctxLogger.Info("Equivalent curl command", zap.Reflect("URL", request.URL()))
 	_, err := req.Invoke()
 	if err != nil {
 		return err

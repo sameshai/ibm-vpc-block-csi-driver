@@ -1,11 +1,13 @@
-# ubuntu:24.04 (Noble) is required for BMS NVMe-oF/TCP support.
-# nvme-cli 2.9 ships in the Ubuntu 24.04 default apt repo, satisfying the
-# >=2.16 requirement for `nvme connect --tls-key`.
+# ubuntu:26.04 is required for BMS NVMe-oF/TCP support.
+# BMS needs nvme-cli >=2.16: `nvme check-tls-key --insert` from nvme-cli 2.8
+# (Ubuntu 24.04) creates a key the target rejects with a TLS "Decrypt error"
+# (nvme connect --tls then fails with "Permission denied"); 2.16 works.
+# Ubuntu 26.04 ships nvme-cli 2.16 in its default apt repo.
 #
 # Note: ktls-utils (tlshd) is a BMS node OS prerequisite — like iscsid for
 # iSCSI — and is NOT installed in this container image.  It must be present
 # on the BMS worker node OS before scheduling any BMS workloads.
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 
 # Default values
 ARG git_commit_id=unknown

@@ -43,9 +43,9 @@ func (ss *SnapshotService) GetSnapshot(snapshotID string, ctxLogger *zap.Logger)
 	var apiErr models.Error
 
 	request := ss.client.NewRequest(operation)
-	ctxLogger.Info("Equivalent curl command", zap.Reflect("URL", request.URL()), zap.Reflect("Operation", operation))
 
 	req := request.PathParameter(snapshotIDParam, snapshotID)
+	ctxLogger.Info("Equivalent curl command", zap.Reflect("URL", request.URL()), zap.Reflect("Operation", operation))
 
 	_, err := req.JSONSuccess(&snapshot).JSONError(&apiErr).Invoke()
 	if err != nil {

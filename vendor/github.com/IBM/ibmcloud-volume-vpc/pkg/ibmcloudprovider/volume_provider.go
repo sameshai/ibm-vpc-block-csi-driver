@@ -55,7 +55,7 @@ const (
 	//                     be registered with VPC via `ibmcloud is key-create`
 	//                     before creating BMS volume attachments so VPC can
 	//                     encrypt the PSK ciphertext.
-	bmsSecretName = "storage-bm-secret"
+	bmsSecretName = "storage-bm-secret" //nolint:gosec // G101: name of the Secret, not a credential
 
 	// bmsSecretPrivKeyField is the Secret data key that holds the
 	// PEM-encoded RSA private key (used by the node DaemonSet only).
@@ -70,7 +70,7 @@ const (
 	// bmsSecretPubKeyField names the public-key field stored in the secret for
 	// operator reference.  The driver does not read this field; it is used only
 	// during one-time VPC SSH Key registration.
-	bmsSecretPubKeyField = "rsa_public_key" //nolint:deadcode,unused
+	bmsSecretPubKeyField = "rsa_public_key" //nolint:unused,gosec // G101: Secret data key name, not a credential
 )
 
 // IBMCloudStorageProvider Provider

@@ -51,7 +51,6 @@ type VolumeAttachManager interface {
 	//   storage_access.encrypted_secret → RSA-encrypted PSK ciphertext
 	// BMS-only: returns error on non-BMS managers.
 	GetBMSServer(serverID string, ctxLogger *zap.Logger) (*models.BMSServerResponse, error)
-
 }
 
 // VolumeAttachService ...

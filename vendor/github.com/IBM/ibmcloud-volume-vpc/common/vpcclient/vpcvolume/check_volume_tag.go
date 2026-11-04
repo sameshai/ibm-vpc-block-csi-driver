@@ -42,9 +42,9 @@ func (vs *VolumeService) CheckVolumeTag(volumeID string, tagName string, ctxLogg
 	var apiErr models.Error
 
 	request := vs.client.NewRequest(operation)
-	ctxLogger.Info("Equivalent curl command", zap.Reflect("URL", request.URL()), zap.Reflect("Operation", operation))
 
 	req := request.PathParameter(volumeIDParam, volumeID).PathParameter(volumeTagParam, tagName).JSONError(&apiErr)
+	ctxLogger.Info("Equivalent curl command", zap.Reflect("URL", request.URL()), zap.Reflect("Operation", operation))
 	_, err := req.Invoke()
 	if err != nil {
 		return err

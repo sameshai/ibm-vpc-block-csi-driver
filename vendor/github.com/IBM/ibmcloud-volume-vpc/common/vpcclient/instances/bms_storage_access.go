@@ -60,7 +60,7 @@ func (vs *VolumeAttachService) RotateEncryptedSecret(serverID, keyID string, ctx
 	}
 
 	apiErr := vs.receiverError
-	operationRequest := vs.client.NewRequest(operation)
+	operationRequest := vs.client.NewRequest(operation).PathParameter(instanceIDParam, serverID)
 
 	ctxLogger.Info("Equivalent curl command and payload details",
 		zap.Reflect("URL", operationRequest.URL()),
@@ -69,7 +69,6 @@ func (vs *VolumeAttachService) RotateEncryptedSecret(serverID, keyID string, ctx
 		zap.String("serverID", serverID))
 
 	_, err := operationRequest.
-		PathParameter(instanceIDParam, serverID).
 		JSONBody(reqBody).
 		JSONError(apiErr).
 		Invoke()
@@ -97,7 +96,7 @@ func (vs *VolumeAttachService) GetBMSServer(serverID string, ctxLogger *zap.Logg
 
 	var server models.BMSServerResponse
 	apiErr := vs.receiverError
-	operationRequest := vs.client.NewRequest(operation)
+	operationRequest := vs.client.NewRequest(operation).PathParameter(instanceIDParam, serverID)
 
 	ctxLogger.Info("Equivalent curl command and payload details",
 		zap.Reflect("URL", operationRequest.URL()),
@@ -105,7 +104,6 @@ func (vs *VolumeAttachService) GetBMSServer(serverID string, ctxLogger *zap.Logg
 		zap.String("serverID", serverID))
 
 	_, err := operationRequest.
-		PathParameter(instanceIDParam, serverID).
 		JSONSuccess(&server).
 		JSONError(apiErr).
 		Invoke()
@@ -113,10 +111,6 @@ func (vs *VolumeAttachService) GetBMSServer(serverID string, ctxLogger *zap.Logg
 		return nil, err
 	}
 
-	ctxLogger.Info("GetBMSServer: succeeded",
-		zap.String("serverID", serverID),
-		zap.String("hostNQN", server.NVMeQualifiedName),
-		zap.Bool("encryptedSecretPresent", server.StorageAccess != nil && server.StorageAccess.EncryptedSecret != ""))
 	return &server, nil
 }
 

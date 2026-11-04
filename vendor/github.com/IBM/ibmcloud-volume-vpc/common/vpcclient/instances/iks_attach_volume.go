@@ -53,6 +53,9 @@ func (vs *IKSVolumeAttachService) AttachVolume(volumeAttachmentTemplate *models.
 		return nil, err
 	}
 
-	ctxLogger.Info("Successfully attached the volume")
+	ctxLogger.Info("Successfully attached the volume",
+		zap.String("workerID", *volumeAttachmentTemplate.InstanceID),
+		zap.String("volumeID", vol.ID),
+		zap.String("volumeAttachmentID", volumeAttachment.ID))
 	return &volumeAttachment, nil
 }

@@ -29,8 +29,8 @@ github.com/IBM/ibmcloud-volume-interface/lib/utils/reasoncode
 github.com/IBM/ibmcloud-volume-interface/provider/auth
 github.com/IBM/ibmcloud-volume-interface/provider/iam
 github.com/IBM/ibmcloud-volume-interface/provider/local
-# github.com/IBM/ibmcloud-volume-vpc v1.1.25-0.20261030150911-4554bd047aa5
-## explicit; go 1.26.9
+# github.com/IBM/ibmcloud-volume-vpc v1.1.25-0.20261030150911-4554bd047aa5 => github.com/bhoopesh-keshari/ibmcloud-volume-vpc v1.1.25-0.20261104113608-0f741d131366
+## explicit; go 1.26.10
 github.com/IBM/ibmcloud-volume-vpc/block/provider
 github.com/IBM/ibmcloud-volume-vpc/block/utils
 github.com/IBM/ibmcloud-volume-vpc/block/vpcconfig
@@ -282,7 +282,7 @@ github.com/stretchr/testify/assert/yaml
 # github.com/x448/float16 v0.8.4
 ## explicit; go 1.11
 github.com/x448/float16
-# go.mongodb.org/mongo-driver v1.17.7
+# go.mongodb.org/mongo-driver v1.17.10
 ## explicit; go 1.18
 go.mongodb.org/mongo-driver/bson
 go.mongodb.org/mongo-driver/bson/bsoncodec
@@ -326,7 +326,7 @@ go.yaml.in/yaml/v3
 # golang.org/x/crypto v0.58.0
 ## explicit; go 1.26.0
 golang.org/x/crypto/sha3
-# golang.org/x/net v0.61.0
+# golang.org/x/net v0.62.0
 ## explicit; go 1.26.0
 golang.org/x/net/context
 golang.org/x/net/html
@@ -925,3 +925,4 @@ sigs.k8s.io/yaml
 # k8s.io/legacy-cloud-providers => k8s.io/legacy-cloud-providers v0.32.10
 # k8s.io/metrics => k8s.io/metrics v0.32.10
 # k8s.io/sample-apiserver => k8s.io/sample-apiserver v0.32.10
+# github.com/IBM/ibmcloud-volume-vpc => github.com/bhoopesh-keshari/ibmcloud-volume-vpc v1.1.25-0.20261104113608-0f741d131366

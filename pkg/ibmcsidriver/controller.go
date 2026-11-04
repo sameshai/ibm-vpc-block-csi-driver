@@ -225,64 +225,193 @@ func (csiCS *CSIControllerServer) DeleteVolume(ctx context.Context, req *csi.Del
 	return &csi.DeleteVolumeResponse{}, nil
 }
 
+// bmsRotatePollInterval and bmsRotatePollTimeout control how long
+// getBMSServerInfo waits for an asynchronous rotate to take effect.
+// VPC returns success from the rotate call immediately but only swaps in the new
+// ciphertext (and sets storage_access.rotated_at) ~15s later. Variables so tests can shorten them.
+var (
+	bmsRotatePollInterval = 5 * time.Second
+	bmsRotatePollTimeout  = 120 * time.Second
+)
+
 // getBMSServerInfo returns the host NQN and RSA-encrypted PSK for the given
 // BMS serverID using a pure in-memory cache.
 //
 // Cache strategy (both maps keyed by serverID):
-//   bmsCacheHostNQN  — host NQN  (nvme_qualified_name)
-//   bmsCacheSecret   — encrypted PSK ciphertext
+//
+//	bmsCacheHostNQN  — host NQN  (nvme_qualified_name)
+//	bmsCacheSecret   — encrypted PSK ciphertext
 //
 // Fast path: both present in cache → 0 VPC calls.
-// Slow path: either absent → rotate(1) + GetBMSServer(1), then populate both.
+// Slow path: either absent →
+//
+//  1. GetBMSServer  (baseline ciphertext, before the rotate)
+//  2. rotate        (asynchronous in VPC: returns success before the new secret is visible)
+//  3. GetBMSServer  polled until the ciphertext differs from the baseline
+//
+// then populate both maps. Rotation always produces a new ciphertext (RSA
+// padding is random) and the ciphertext is stable between rotations, so "ciphertext
+// changed" means "rotation finished". If the rotate call itself fails (e.g. 409:
+// rotated less than 1 hour ago) the baseline is used as-is; if the rotation does
+// not show up within bmsRotatePollTimeout an error is returned so the attach is
+// retried instead of handing the node a stale PSK.
 //
 // On controller restart the maps are empty → slow path on first attach per
-// server, which is correct: fresh rotate ensures the ciphertext was encrypted
-// with the current RSA key.
-func (csiCS *CSIControllerServer) getBMSServerInfo(_ context.Context, ctxLogger *zap.Logger, sess provider.Session, serverID string) (hostNQN, encryptedSecret string, err error) {
+// server.
+func (csiCS *CSIControllerServer) getBMSServerInfo(ctx context.Context, ctxLogger *zap.Logger, sess provider.Session, serverID string) (string, string, error) {
 	// Fast path
-	csiCS.bmsCacheMu.RLock()
-	cachedNQN := csiCS.bmsCacheHostNQN[serverID]
-	cachedSecret := csiCS.bmsCacheSecret[serverID]
-	csiCS.bmsCacheMu.RUnlock()
-
-	if cachedNQN != "" && cachedSecret != "" {
-		ctxLogger.Info("getBMSServerInfo: cache hit — 0 VPC calls", zap.String("serverID", serverID))
+	if cachedNQN, cachedSecret, ok := csiCS.getCachedBMSServerInfo(serverID); ok {
+		// A cache hit means NO rotate and NO fetch: whatever ciphertext was cached
+		// when this controller process first attached to the server is reused. If
+		// anything rotated the secret since, this value is stale.
+		ctxLogger.Info("getBMSServerInfo: cache hit — 0 VPC calls, reusing cached ciphertext (not re-fetched from VPC)",
+			zap.String("serverID", serverID))
 		return cachedNQN, cachedSecret, nil
 	}
 
-	// Slow path: rotate then fetch
-	ctxLogger.Info("getBMSServerInfo: cache miss — calling rotate + GetBMSServer",
+	// Slow path: baseline fetch, rotate, then wait for the new ciphertext.
+	ctxLogger.Info("getBMSServerInfo: cache miss — fetching baseline, rotating, then waiting for the new ciphertext",
 		zap.String("serverID", serverID))
 
-	keyID := csiCS.CSIProvider.GetBMSKeyID()
-	if keyID != "" {
-		if rotErr := sess.RotateBMSEncryptedSecret(serverID, keyID); rotErr != nil {
-			ctxLogger.Warn("getBMSServerInfo: rotate failed — GetBMSServer may return stale ciphertext",
-				zap.String("serverID", serverID), zap.Error(rotErr))
-		}
-	} else {
-		ctxLogger.Warn("getBMSServerInfo: key_id not configured — skipping rotate")
-	}
-
-	info, getErr := sess.GetBMSServer(serverID)
+	// [1/3] Baseline fetch: the ciphertext as it is BEFORE we rotate.
+	serverInfo, getErr := sess.GetBMSServer(serverID)
 	if getErr != nil {
 		return "", "", fmt.Errorf("getBMSServerInfo: GetBMSServer failed for server %s: %w", serverID, getErr)
 	}
-	if info.HostNQN == "" {
-		return "", "", fmt.Errorf("getBMSServerInfo: empty nvme_qualified_name for server %s", serverID)
+	if serverInfo == nil {
+		return "", "", fmt.Errorf("getBMSServerInfo: GetBMSServer returned no data for server %s", serverID)
+	}
+	ctxLogger.Info("getBMSServerInfo: [1/3] baseline ciphertext fetched (pre-rotate)",
+		zap.String("serverID", serverID),
+		zap.Bool("encryptedSecretPresent", serverInfo.EncryptedSecret != ""))
+	baselineSecret := serverInfo.EncryptedSecret
+
+	// [2/3] Rotate, only when a key_id is configured and VPC accepts the call.
+	// If the rotate is skipped or fails, the baseline (pre-rotate) ciphertext is used as-is.
+	keyID := csiCS.CSIProvider.GetBMSKeyID()
+	if rotateDoneAt, rotated := rotateBMSServerSecret(ctxLogger, sess, serverID, keyID); rotated {
+		// [3/3] Rotation is asynchronous: wait for the new ciphertext.
+		rotatedInfo, waitErr := waitForBMSRotation(ctx, ctxLogger, sess, serverID, baselineSecret, rotateDoneAt)
+		if waitErr != nil {
+			return "", "", waitErr
+		}
+		serverInfo = rotatedInfo
 	}
 
-	// Populate cache
+	ctxLogger.Info("getBMSServerInfo: encrypted secret rotated and published in bm get api",
+		zap.String("serverID", serverID),
+		zap.Bool("differsFromBaseline", serverInfo.EncryptedSecret != baselineSecret))
+
+	if err := validateBMSServerInfo(serverID, keyID != "", serverInfo); err != nil {
+		return "", "", err
+	}
+	csiCS.cacheBMSServerInfo(ctxLogger, serverID, serverInfo)
+	return serverInfo.HostNQN, serverInfo.EncryptedSecret, nil
+}
+
+// getCachedBMSServerInfo returns the cached host NQN and ciphertext for
+// serverID. ok is true only when both are present.
+func (csiCS *CSIControllerServer) getCachedBMSServerInfo(serverID string) (hostNQN, encryptedSecret string, ok bool) {
+	csiCS.bmsCacheMu.RLock()
+	defer csiCS.bmsCacheMu.RUnlock()
+	hostNQN = csiCS.bmsCacheHostNQN[serverID]
+	encryptedSecret = csiCS.bmsCacheSecret[serverID]
+	return hostNQN, encryptedSecret, hostNQN != "" && encryptedSecret != ""
+}
+
+// cacheBMSServerInfo stores the host NQN and ciphertext for serverID.
+func (csiCS *CSIControllerServer) cacheBMSServerInfo(ctxLogger *zap.Logger, serverID string, info *provider.BMSServerInfo) {
 	csiCS.bmsCacheMu.Lock()
 	csiCS.bmsCacheHostNQN[serverID] = info.HostNQN
 	csiCS.bmsCacheSecret[serverID] = info.EncryptedSecret
 	csiCS.bmsCacheMu.Unlock()
 
-	ctxLogger.Info("getBMSServerInfo: cache populated",
+	ctxLogger.Info("getBMSServerInfo: cache populated (this ciphertext is reused for every later attach until the controller restarts)",
 		zap.String("serverID", serverID),
 		zap.String("hostNQN", info.HostNQN),
 		zap.Bool("encryptedSecretPresent", info.EncryptedSecret != ""))
-	return info.HostNQN, info.EncryptedSecret, nil
+}
+
+// validateBMSServerInfo checks that the server info is usable for a BMS attach.
+func validateBMSServerInfo(serverID string, keyIDConfigured bool, info *provider.BMSServerInfo) error {
+	// Every BMS volume connects over TLS and needs the PSK. Without a ciphertext
+	// the node cannot connect, so fail the attach here instead of caching an empty
+	// secret and letting nvme connect fail later with an opaque error.
+	if info.EncryptedSecret == "" {
+		return fmt.Errorf("getBMSServerInfo: no encrypted secret available for server %s (key_id configured: %t); cannot establish TLS connection",
+			serverID, keyIDConfigured)
+	}
+	if info.HostNQN == "" {
+		return fmt.Errorf("getBMSServerInfo: empty nvme_qualified_name (host NQN) for server %s", serverID)
+	}
+	return nil
+}
+
+// rotateBMSServerSecret asks VPC to re-encrypt the PSK with our public key.
+// rotated is true only when VPC accepted the call, in which case the new
+// ciphertext appears asynchronously and rotateDoneAt is when the call returned.
+// It is false when:
+//   - no keyID is configured → rotate is skipped;
+//   - the rotate call fails (e.g. 409: rotated less than 1 hour ago) → the
+//     current ciphertext is already encrypted with the current key.
+//
+// In both cases the caller keeps using the baseline ciphertext.
+func rotateBMSServerSecret(ctxLogger *zap.Logger, sess provider.Session, serverID, keyID string) (rotateDoneAt time.Time, rotated bool) {
+	if keyID == "" {
+		ctxLogger.Warn("getBMSServerInfo: key_id is not configured — skipping rotate, using baseline ciphertext",
+			zap.String("serverID", serverID))
+		return time.Time{}, false
+	}
+
+	// [2/3] Rotate.
+	ctxLogger.Info("getBMSServerInfo: [2/3] rotating encrypted secret — VPC will re-encrypt the PSK with our public key (asynchronous)",
+		zap.String("serverID", serverID), zap.String("keyID", keyID),
+		zap.Time("at", time.Now().UTC()))
+	rotStart := time.Now()
+	if rotErr := sess.RotateBMSEncryptedSecret(serverID, keyID); rotErr != nil {
+		ctxLogger.Warn("getBMSServerInfo: [2/3] rotate failed — using baseline ciphertext",
+			zap.String("serverID", serverID), zap.Duration("elapsed", time.Since(rotStart)), zap.Error(rotErr))
+		return time.Time{}, false
+	}
+	rotateDoneAt = time.Now()
+	ctxLogger.Info("getBMSServerInfo: [2/3] rotate API call succeeded — rotation is asynchronous, waiting for the ciphertext to change",
+		zap.String("serverID", serverID), zap.Duration("elapsed", time.Since(rotStart)),
+		zap.Time("rotateReturnedAt", rotateDoneAt.UTC()))
+	return rotateDoneAt, true
+}
+
+// waitForBMSRotation polls GetBMSServer until the ciphertext is non-empty and
+// differs from baselineSecret, i.e. the asynchronous rotation has finished. It
+// fails if that does not happen within bmsRotatePollTimeout, or if ctx is done,
+// so the attach is retried instead of handing the node a stale PSK.
+func waitForBMSRotation(ctx context.Context, ctxLogger *zap.Logger, sess provider.Session, serverID, baselineSecret string, rotateDoneAt time.Time) (*provider.BMSServerInfo, error) {
+	deadline := time.Now().Add(bmsRotatePollTimeout)
+	for attempt := 1; ; attempt++ {
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("getBMSServerInfo: rotation for server %s was not visible after %s (ciphertext unchanged); retry the attach",
+				serverID, bmsRotatePollTimeout)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("getBMSServerInfo: interrupted while waiting for rotation of server %s: %w", serverID, ctx.Err())
+		case <-time.After(bmsRotatePollInterval):
+		}
+		polled, pollErr := sess.GetBMSServer(serverID)
+		if pollErr != nil || polled == nil {
+			ctxLogger.Warn("getBMSServerInfo: [3/3] poll failed, will retry",
+				zap.String("serverID", serverID), zap.Int("attempt", attempt),
+				zap.Bool("emptyResponse", polled == nil), zap.Error(pollErr))
+			continue
+		}
+		changed := polled.EncryptedSecret != "" && polled.EncryptedSecret != baselineSecret
+		ctxLogger.Info("getBMSServerInfo: [3/3] polled after rotate",
+			zap.String("serverID", serverID), zap.Int("attempt", attempt),
+			zap.Bool("ciphertextChanged", changed),
+			zap.Duration("sinceRotateReturned", time.Since(rotateDoneAt)))
+		if changed {
+			return polled, nil
+		}
+	}
 }
 
 // ControllerPublishVolume ...
@@ -345,9 +474,10 @@ func (csiCS *CSIControllerServer) ControllerPublishVolume(ctx context.Context, r
 		},
 	}
 
-	// For self-managed clusters (clusterID == "") on bare metal nodes, use the
+	// For self-managed clusters on bare metal nodes, use the
 	// BMS SDP attach path instead of the IKS/VSI path.
-	if clusterID == "" && isBaremetalNode(nodeID, ctxLogger) {
+	if isSelfManagedCluster(clusterID) && isBaremetalNode(nodeID, ctxLogger) {
+		volumeAttachmentReq.InstanceID = strings.TrimPrefix(strings.TrimPrefix(nodeID, "bms-"), "bms:")
 		volumeAttachmentReq.IKSVolumeAttachment = nil
 		volumeAttachmentReq.BMSVolumeAttachment = &provider.BMSVolumeAttachment{
 			Protocol: "nvme_tcp",
@@ -384,8 +514,10 @@ func (csiCS *CSIControllerServer) ControllerPublishVolume(ctx context.Context, r
 		// getBMSServerInfo handles rotate + GetBMSServer with in-memory caching:
 		//   cache hit  → 0 VPC calls
 		//   cache miss → rotate(1) + GetBMSServer(1), then populate cache
+		// Use the bare server UUID (the "bms-" prefix is stripped above); the
+		// VPC bare_metal_servers API does not accept the prefixed node ID.
 		hostNQN, encryptedSecret, infoErr := csiCS.getBMSServerInfo(
-			ctx, ctxLogger, sess, req.GetNodeId())
+			ctx, ctxLogger, sess, volumeAttachmentReq.InstanceID)
 		if infoErr != nil {
 			return nil, commonError.GetCSIError(ctxLogger, commonError.InternalError, requestID, infoErr)
 		}
@@ -396,7 +528,7 @@ func (csiCS *CSIControllerServer) ControllerPublishVolume(ctx context.Context, r
 		if encryptedSecret != "" {
 			extraPublishInfo[PublishInfoBMSEncryptedSecret] = encryptedSecret // pragma: allowlist secret
 		}
-		ctxLogger.Info("BMS publishContext built",
+		ctxLogger.Info("BMS publishContext built — this ciphertext is stored in the VolumeAttachment and handed to the node as-is",
 			zap.String("subsysNQN", response.BMSResponse.SubsystemNQN),
 			zap.String("hostNQN", hostNQN),
 			zap.Int("targetIPs", len(response.BMSResponse.TargetIPs)),
@@ -438,9 +570,10 @@ func (csiCS *CSIControllerServer) ControllerUnpublishVolume(ctx context.Context,
 		},
 	}
 
-	// For self-managed clusters (clusterID == "") on bare metal nodes, use the
+	// For self-managed clusters on bare metal nodes, use the
 	// BMS SDP detach path instead of the IKS/VSI path.
-	if clusterID == "" && isBaremetalNode(nodeID, ctxLogger) {
+	if isSelfManagedCluster(clusterID) && isBaremetalNode(nodeID, ctxLogger) {
+		volumeAttachmentReq.InstanceID = strings.TrimPrefix(strings.TrimPrefix(nodeID, "bms-"), "bms:")
 		volumeAttachmentReq.IKSVolumeAttachment = nil
 		volumeAttachmentReq.BMSVolumeAttachment = &provider.BMSVolumeAttachment{
 			Protocol: "nvme_tcp",

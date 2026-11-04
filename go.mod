@@ -1,6 +1,6 @@
 module github.com/kubernetes-sigs/ibm-vpc-block-csi-driver
 
-go 1.26.9
+go 1.26.10
 
 require (
 	github.com/IBM/ibm-csi-common v1.1.26
@@ -74,14 +74,14 @@ require (
 	github.com/prometheus/procfs v0.16.1 // indirect
 	github.com/spf13/pflag v1.0.9 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
-	go.mongodb.org/mongo-driver v1.17.7 // indirect
+	go.mongodb.org/mongo-driver v1.17.10 // indirect
 	go.opentelemetry.io/otel v1.44.0 // indirect
 	go.opentelemetry.io/otel/trace v1.44.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.3 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	golang.org/x/crypto v0.58.0 // indirect
-	golang.org/x/net v0.61.0 // indirect
+	golang.org/x/net v0.62.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/term v0.47.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
@@ -124,3 +124,8 @@ replace (
 	k8s.io/metrics => k8s.io/metrics v0.32.10
 	k8s.io/sample-apiserver => k8s.io/sample-apiserver v0.32.10
 )
+
+// TODO: This points to a forked branch (bhoopesh-keshari/ibmcloud-volume-vpc, bhoopesh-bm-support).
+// Once it is merged into IBM/ibmcloud-volume-vpc master, remove this replace and run
+// `go get github.com/IBM/ibmcloud-volume-vpc@master` followed by `go mod tidy && go mod vendor`.
+replace github.com/IBM/ibmcloud-volume-vpc => github.com/bhoopesh-keshari/ibmcloud-volume-vpc v1.1.25-0.20261104113608-0f741d131366

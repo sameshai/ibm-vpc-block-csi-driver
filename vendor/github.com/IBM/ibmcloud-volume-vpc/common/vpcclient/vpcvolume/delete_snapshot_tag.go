@@ -42,9 +42,9 @@ func (ss *SnapshotService) DeleteSnapshotTag(volumeID string, snapshotID string,
 	var apiErr models.Error
 
 	request := ss.client.NewRequest(operation)
-	ctxLogger.Info("Equivalent curl command", zap.Reflect("URL", request.URL()), zap.Reflect("Operation", operation))
 
 	req := request.PathParameter(volumeIDParam, volumeID).PathParameter(snapshotIDParam, snapshotID).PathParameter(snapshotTagParam, tagName).JSONError(&apiErr)
+	ctxLogger.Info("Equivalent curl command", zap.Reflect("URL", request.URL()), zap.Reflect("Operation", operation))
 	_, err := req.Invoke()
 	if err != nil {
 		return err

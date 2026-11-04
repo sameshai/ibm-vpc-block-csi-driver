@@ -18,13 +18,8 @@
 package riaas
 
 import (
-	"context"
-	"net/url"
-	"strconv"
-
 	"github.com/IBM/ibmcloud-volume-vpc/common/vpcclient/client"
 	"github.com/IBM/ibmcloud-volume-vpc/common/vpcclient/instances"
-	"github.com/IBM/ibmcloud-volume-vpc/common/vpcclient/models"
 	"github.com/IBM/ibmcloud-volume-vpc/common/vpcclient/vpcvolume"
 )
 
@@ -52,37 +47,8 @@ type Session struct {
 
 // New creates a new Session volume, using the supplied config
 func New(config Config) (*Session, error) {
-	ctx := config.Context
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	// Default API version
-	backendAPIVersion := models.APIVersion
-
-	// Overwrite if the version is passed
-	if len(config.APIVersion) > 0 {
-		backendAPIVersion = config.APIVersion
-	}
-
-	// Overwrite if the generation is passed
-	apiGen := models.APIGeneration
-	if config.APIGeneration > 0 {
-		apiGen = config.APIGeneration
-	}
-
-	queryValues := url.Values{
-		"version":    []string{backendAPIVersion},
-		"generation": []string{strconv.Itoa(apiGen)},
-	}
-
-	riaasClient := client.New(ctx, config.baseURL(), queryValues, config.httpClient(), config.ContextID, config.ResourceGroup)
-
-	if config.DebugWriter != nil {
-		riaasClient.WithDebug(config.DebugWriter)
-	}
 	return &Session{
-		client: riaasClient,
+		client: newBaseClient(config),
 		config: config,
 	}, nil
 }
@@ -96,27 +62,27 @@ func (s *Session) Login(token string) error {
 
 // VolumeService returns the Volume service for managing volumes
 func (s *Session) VolumeService() vpcvolume.VolumeManager {
-	return vpcvolume.New(s.client)
+	return vpcvolume.New(newClient(s.client, profileVPC, s.config))
 }
 
 // VolumeAttachService returns the VolumeAttachService for managing volumes
 func (s *Session) VolumeAttachService() instances.VolumeAttachManager {
-	return instances.New(s.client)
+	return instances.New(newClient(s.client, profileVPC, s.config))
 }
 
 // IKSVolumeAttachService returns the VolumeAttachService for managing volumes through IKS
 func (s *Session) IKSVolumeAttachService() instances.VolumeAttachManager {
-	return instances.NewIKSVolumeAttachmentManager(s.client)
+	return instances.NewIKSVolumeAttachmentManager(newClient(s.client, profileIKS, s.config))
 }
 
 // BMSVolumeAttachService returns the VolumeAttachService for managing BMS SDP volume attachments
 func (s *Session) BMSVolumeAttachService() instances.VolumeAttachManager {
-	return instances.NewBMSVolumeAttachmentManager(s.client)
+	return instances.NewBMSVolumeAttachmentManager(newClient(s.client, profileBMS, s.config))
 }
 
 // SnapshotService returns the Snapshot service for managing snapshot
 func (s *Session) SnapshotService() vpcvolume.SnapshotManager {
-	return vpcvolume.NewSnapshotManager(s.client)
+	return vpcvolume.NewSnapshotManager(newClient(s.client, profileVPC, s.config))
 }
 
 // RegionalAPIClientProvider declares an interface for a provider that can supply a new
@@ -148,7 +114,7 @@ var _ RegionalAPI = &IKSSession{}
 
 // VolumeService returns the Volume service for managing volumes
 func (s *IKSSession) VolumeService() vpcvolume.VolumeManager {
-	return vpcvolume.NewIKSVolumeService(s.client)
+	return vpcvolume.NewIKSVolumeService(newClient(s.client, profileIKS, s.config))
 }
 
 // IKSRegionalAPIClientProvider ...

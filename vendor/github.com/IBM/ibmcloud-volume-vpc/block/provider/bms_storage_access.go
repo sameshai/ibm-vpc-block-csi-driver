@@ -74,8 +74,9 @@ func (vpcs *VPCSession) RotateBMSEncryptedSecret(serverID, keyID string) error {
 // the host NQN and the RSA-encrypted PSK ciphertext in a single round-trip.
 //
 // Per the VPC BMS Block Storage SDP User Guide:
-//   nvme_qualified_name            → HOSTNQN  (initiator NQN of this BMS)
-//   storage_access.encrypted_secret → PSK ciphertext encrypted with this cluster's RSA key
+//
+//	nvme_qualified_name            → HOSTNQN  (initiator NQN of this BMS)
+//	storage_access.encrypted_secret → PSK ciphertext encrypted with this cluster's RSA key
 //
 // Call RotateBMSEncryptedSecret first so the ciphertext is encrypted with
 // this cluster's RSA public key before calling GetBMSServer.

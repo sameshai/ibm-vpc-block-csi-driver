@@ -27,7 +27,7 @@ const (
 
 	// BMS paths — used by RotateEncryptedSecret and GetBMSServer.
 	// All operations share the same server-ID path parameter (instanceIDParam).
-	bmsServerSuffix       = instanceIDPath                               // GET  /bare_metal_servers/{id}
+	bmsServerSuffix       = instanceIDPath                                             // GET  /bare_metal_servers/{id}
 	bmsRotateSecretSuffix = instanceIDPath + "/storage_access/encrypted_secret/rotate" // POST
 
 	// VpcPathPrefix  VPC URL path prefix

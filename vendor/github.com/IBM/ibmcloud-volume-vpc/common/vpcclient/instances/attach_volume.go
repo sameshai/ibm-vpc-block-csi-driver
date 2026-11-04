@@ -44,12 +44,14 @@ func (vs *VolumeAttachService) AttachVolume(volumeAttachmentTemplate *models.Vol
 
 	operationRequest := vs.client.NewRequest(operation)
 
+	operationRequest = vs.populatePathPrefixParameters(operationRequest, volumeAttachmentTemplate)
 	ctxLogger.Info("Equivalent curl command and payload details", zap.Reflect("URL", operationRequest.URL()), zap.Reflect("Payload", volumeAttachmentTemplate), zap.Reflect("Operation", operation), zap.Reflect("PathParameters", volumeAttachmentTemplate.InstanceID))
-	_, err := vs.populatePathPrefixParameters(operationRequest, volumeAttachmentTemplate).JSONBody(volumeAttachmentTemplate).JSONSuccess(&volumeAttachment).JSONError(apiErr).Invoke()
+	_, err := operationRequest.JSONBody(volumeAttachmentTemplate).JSONSuccess(&volumeAttachment).JSONError(apiErr).Invoke()
 	if err != nil {
 		return nil, err
 	}
 
-	ctxLogger.Info("Successfully attached the volume")
+	ctxLogger.Info("Successfully attached the volume",
+		zap.String("volumeAttachmentID", volumeAttachment.ID))
 	return &volumeAttachment, nil
 }

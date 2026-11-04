@@ -539,17 +539,17 @@ func getPrefedTopologyParams(topList []*csi.Topology) (map[string]string, error)
 	return nil, fmt.Errorf("preferred topologies specified but no segments")
 }
 
-/*
-1.) IF user does not given the value DEFAULT_SNAPSHOT_CREATE_DELAY mins
-2.) IF user has given more than MAX_SNAPSHOT_CREATE_DELAY default is MAX_SNAPSHOT_CREATE_DELAY
-3.) In case of any invalid value DEFAULT_SNAPSHOT_CREATE_DELAY mins
-*/
+// isSelfManagedCluster returns true when the cluster is self-managed, i.e. it has no IKS cluster ID.
+func isSelfManagedCluster(clusterID string) bool {
+	return clusterID == ""
+}
+
 // isBaremetalNode returns true when the CSI node ID identifies a bare metal server.
 // It checks whether the node ID contains the well-known BMS node label prefix
 // "ibm-cloud.kubernetes.io/worker-pool-type=bms" set on BMS worker nodes, or
 // falls back to a simple heuristic: BMS node IDs reported by the VPC metadata
 // API contain the substring "bms" (case-insensitive prefix match).
-// This function is called only when clusterID == "" (self-managed cluster), so
+// This function is called only for self-managed clusters (see isSelfManagedCluster), so
 // false positives on IKS clusters are impossible by construction.
 func isBaremetalNode(nodeID string, logger *zap.Logger) bool {
 	// Node IDs for BMS workers are prefixed with "bms-" in the VPC metadata API.
@@ -561,6 +561,11 @@ func isBaremetalNode(nodeID string, logger *zap.Logger) bool {
 	return isBMS
 }
 
+/*
+1.) IF user does not given the value DEFAULT_SNAPSHOT_CREATE_DELAY mins
+2.) IF user has given more than MAX_SNAPSHOT_CREATE_DELAY default is MAX_SNAPSHOT_CREATE_DELAY
+3.) In case of any invalid value DEFAULT_SNAPSHOT_CREATE_DELAY mins
+*/
 func getMaxDelaySnapshotCreate(ctxLogger *zap.Logger) int {
 	userDelayEnv := os.Getenv("CUSTOM_SNAPSHOT_CREATE_DELAY")
 	if userDelayEnv == "" {

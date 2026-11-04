@@ -42,9 +42,10 @@ func (vs *VolumeService) DeleteVolume(volumeID string, ctxLogger *zap.Logger) er
 	var apiErr models.Error
 
 	request := vs.client.NewRequest(operation)
-	ctxLogger.Info("Equivalent curl command", zap.Reflect("URL", request.URL()), zap.Reflect("Operation", operation))
 
-	_, err := request.PathParameter(volumeIDParam, volumeID).JSONError(&apiErr).Invoke()
+	request.PathParameter(volumeIDParam, volumeID)
+	ctxLogger.Info("Equivalent curl command", zap.Reflect("URL", request.URL()), zap.Reflect("Operation", operation))
+	_, err := request.JSONError(&apiErr).Invoke()
 	if err != nil {
 		return err
 	}

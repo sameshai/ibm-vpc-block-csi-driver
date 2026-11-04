@@ -104,4 +104,3 @@ func (vpcIks *IksVpcSession) RotateBMSEncryptedSecret(serverID, keyID string) er
 func (vpcIks *IksVpcSession) GetBMSServer(serverID string) (*provider.BMSServerInfo, error) {
 	return nil, fmt.Errorf("GetBMSServer is not supported via the IKS session path")
 }
-
